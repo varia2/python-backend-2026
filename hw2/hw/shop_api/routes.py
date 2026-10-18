@@ -1,166 +1,145 @@
 from typing import Optional
 
 from shop_api.contracts import Cart, Item, ItemCreate, ItemPatch
-from fastapi import status, Response, Query, APIRouter, HTTPException
 from shop_api.queries import (
-    build_cart,
-    carts,
-    create_cart_id,
-    create_item_id,
-    get_cart_or_404,
-    get_item_or_404,
-    items,
+    build_cart_response,
+    create_cart,
+    get_cart,
+    get_carts,
+    add_item_to_cart,
+    create_item,
+    get_item,
+    get_items,
+    update_item,
+    patch_item,
+    soft_delete_item,
 )
+from fastapi import status, Response, Query, APIRouter, HTTPException, Depends
+from sqlalchemy.ext.asyncio import AsyncSession
+from shop_api.database import get_db
 
 router_cart = APIRouter(prefix="/cart")
 
+
 @router_cart.post("/", status_code=status.HTTP_201_CREATED)
-def create_cart(response: Response) -> dict[str, int]:
-    cart_id = create_cart_id()
-    carts[cart_id] = {}
-    response.headers["Location"] = f"/cart/{cart_id}"
+async def post_cart_endpoint(
+    response: Response,
+    session: AsyncSession = Depends(get_db),
+) -> dict[str, int]:
+    cart = await create_cart(session)
+    response.headers["Location"] = f"/cart/{cart.id}"
+    return {"id": cart.id}
 
-    return {"id": cart_id}
 
-@router_cart.get("/{cart_id}", response_model=Cart)
-def get_cart(cart_id: int) -> Cart:
-    cart = get_cart_or_404(cart_id)
-    return build_cart(cart_id, cart)
+@router_cart.get("/{cart_id}")
+async def get_cart_endpoint(
+    cart_id: int,
+    session: AsyncSession = Depends(get_db),
+) -> Cart:
+    cart = await get_cart(session, cart_id)
+    if cart is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Cart not found",
+        )
+    return build_cart_response(session, cart)
 
 
 @router_cart.get("/", response_model=list[Cart])
-def get_carts(
+async def get_carts_endpoint(
     offset: int = Query(default=0, ge=0),
     limit: int = Query(default=10, gt=0),
     min_price: Optional[float] = Query(default=None, ge=0),
     max_price: Optional[float] = Query(default=None, ge=0),
     min_quantity: Optional[int] = Query(default=None, ge=0),
     max_quantity: Optional[int] = Query(default=None, ge=0),
+    session: AsyncSession = Depends(get_db),
 ) -> list[Cart]:
-    result: list[Cart] = []
-
-    for cart_id, cart_data in carts.items():
-        cart = build_cart(cart_id, cart_data)
-        if min_price is not None and cart.price < min_price:
-            continue
-        if max_price is not None and cart.price > max_price:
-            continue
-
-        total_quantity = sum(item.quantity for item in cart.items)
-
-        if min_quantity is not None and total_quantity < min_quantity:
-            continue
-        if max_quantity is not None and total_quantity > max_quantity:
-            continue
-        result.append(cart)
-
-    return result[offset : offset + limit]
+    return await get_carts(
+        session, offset, limit, min_price, max_price, min_quantity, max_quantity
+    )
 
 
-@router_cart.post("/{cart_id}/add/{item_id}", response_model=Cart)
-def add_item_to_cart(cart_id: int, item_id: int) -> Cart:
-    cart = get_cart_or_404(cart_id)
-    item = get_item_or_404(item_id)
-    cart[item.id] = cart.get(item.id, 0) + 1
+@router_cart.post(
+    "/{cart_id}/add/{item_id}",
+    response_model=Cart,
+    status_code=status.HTTP_200_OK,
+)
+async def add_item_to_cart_endpoint(
+    cart_id: int,
+    item_id: int,
+    session: AsyncSession = Depends(get_db),
+) -> Cart:
+    return await add_item_to_cart(session, cart_id, item_id)
 
-    return build_cart(cart_id, cart)
 
 router_item = APIRouter(prefix="/item")
 
+
 @router_item.post("/", response_model=Item, status_code=status.HTTP_201_CREATED)
-def create_item(
-    item_data: ItemCreate,
+async def create_item_endpoint(
     response: Response,
+    item_data: ItemCreate,
+    session: AsyncSession = Depends(get_db),
 ) -> Item:
-    item_id = create_item_id()
-
-    item = Item(
-        id=item_id,
-        name=item_data.name,
-        price=item_data.price,
-        deleted=False,
-    )
-    items[item.id] = item
+    item = await create_item(session, item_data.name, item_data.price)
     response.headers["Location"] = f"/item/{item.id}"
-
     return item
 
 
 @router_item.get("/{item_id}", response_model=Item)
-def get_item(item_id: int) -> Item:
-    return get_item_or_404(item_id)
+async def get_item_endpoint(
+    item_id: int,
+    session: AsyncSession = Depends(get_db),
+) -> Item:
+    item = await get_item(session, item_id)
+    if item is None or item.deleted:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Item not found",
+        )
+    return item
 
 
 @router_item.get("/", response_model=list[Item])
-def get_items(
-    offset: int = Query(0, ge=0),
-    limit: int = Query(10, gt=0),
-    min_price: float | None = Query(None, ge=0),
-    max_price: float | None = Query(None, ge=0),
-    show_deleted: bool = False,
+async def get_items_endpoint(
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=10, gt=0),
+    min_price: Optional[float] = Query(default=None, ge=0),
+    max_price: Optional[float] = Query(default=None, ge=0),
+    show_deleted: bool = Query(default=False),
+    session: AsyncSession = Depends(get_db),
 ) -> list[Item]:
-    result: list[Item] = []
-
-    for item in items.values():
-        if item.deleted and not show_deleted:
-            continue
-        if min_price is not None and item.price < min_price:
-            continue
-        if max_price is not None and item.price > max_price:
-            continue
-        result.append(item)
-
-    return result[offset : offset + limit]
+    return await get_items(session, offset, limit, min_price, max_price, show_deleted)
 
 
 @router_item.put("/{item_id}", response_model=Item)
-def replace_item(
+async def update_item_endpoint(
     item_id: int,
     item_data: ItemCreate,
+    session: AsyncSession = Depends(get_db),
 ) -> Item:
-    item = get_item_or_404(item_id)
-    updated_item = Item(
-        id=item.id,
-        name=item_data.name,
-        price=item_data.price,
-        deleted=item.deleted,
-    )
-    items[item_id] = updated_item
-
-    return updated_item
+    return await update_item(session, item_id, item_data.name, item_data.price)
 
 
-@router_item.patch("/{item_id}", response_model=Item)
-def patch_item(
+@router_item.patch("/{item_id}", response_model=None)
+async def patch_item_endpoint(
     item_id: int,
     item_data: ItemPatch,
+    session: AsyncSession = Depends(get_db),
 ) -> Response | Item:
-    item = items.get(item_id)
-    if item is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Item not found",
-        )
-
-    if item.deleted:
+    item, not_modified = await patch_item(
+        session, item_id, item_data.model_dump(exclude_unset=True)
+    )
+    if not_modified:
         return Response(status_code=status.HTTP_304_NOT_MODIFIED)
-    update_data = item_data.model_dump(exclude_unset=True)
-    updated_item = item.model_copy(update=update_data)
-    items[item_id] = updated_item
-
-    return updated_item
+    return item
 
 
 @router_item.delete("/{item_id}")
-def delete_item(item_id: int) -> dict[str, bool]:
-    item = items.get(item_id)
-    if item is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Item not found",
-        )
-    if not item.deleted:
-        items[item_id] = item.model_copy(update={"deleted": True})
-
+async def delete_item_endpoint(
+    item_id: int,
+    session: AsyncSession = Depends(get_db),
+) -> dict[str, bool]:
+    await soft_delete_item(session, item_id)
     return {"deleted": True}
-
