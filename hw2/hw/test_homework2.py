@@ -1,14 +1,66 @@
+import os
+import tempfile
+from contextlib import asynccontextmanager
 from http import HTTPStatus
-from typing import Any
+from typing import Any, Generator, AsyncGenerator
 from uuid import uuid4
+from pathlib import Path
 
-import pytest
+os.environ["DATABASE_URL"] = "sqlite+aiosqlite:/tmp/test_shop.db"
+
 from faker import Faker
 from fastapi.testclient import TestClient
+from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 
-from shop_api.main import app
+from shop_api.database import Base as DB_Base, get_db as original_get_db
+from shop_api.routes import router_cart, router_item
+from fastapi import FastAPI
 
-client = TestClient(app)
+# Create a temporary SQLite file for testing
+_test_db_file = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+_test_db_file.close()
+_test_db_path = Path(_test_db_file.name)
+TEST_DATABASE_URL = f"sqlite+aiosqlite:///{_test_db_path}"
+
+test_engine = create_async_engine(TEST_DATABASE_URL, echo=False)
+TestSessionLocal = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
+
+
+@pytest.fixture(scope="session", autouse=True)
+async def tables_exist():
+    async with test_engine.begin() as conn:
+        await conn.run_sync(DB_Base.metadata.create_all)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def with_test_db():
+    async def _test_get_db() -> AsyncGenerator[AsyncSession, None]:
+        session = TestSessionLocal()
+        try:
+            yield session
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            raise
+        finally:
+            await session.close()
+
+    _test_app.dependency_overrides[original_get_db] = _test_get_db
+    yield
+    _test_app.dependency_overrides.clear()
+
+
+@asynccontextmanager
+async def _lifespan(app_local):
+    yield
+
+
+_test_app = FastAPI(lifespan=_lifespan)
+_test_app.include_router(router_cart)
+_test_app.include_router(router_item)
+
+
+client = TestClient(_test_app)
 faker = Faker()
 
 
